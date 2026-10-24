@@ -17,17 +17,16 @@ import yt_dlp
 BOT_TOKEN = "1780243804:04JcO4bUrX_PxIPNsvwDYr8rOoW5hJQ4kNn"
 ADMIN_ID = 1780243247
 ADMIN_USERNAME = "@PavelSupport"
+CHANNEL_USERNAME = "@PavelBet"
 PORT = int(os.getenv("PORT", "10000"))
 
-# Кастомный сервер (твоя приватка)
+# Кастомный сервер
 CUSTOM_API_SERVER = "https://bot.catup.lol/"
 # =============================================
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("music_bot")
 
-# Настраиваем сессию для работы через ваш сервер (если используется Local Bot API)
-# Если бот должен стучаться напрямую через кастомный сервер:
 session = AiohttpSession(api=TelegramAPIServer.from_base(CUSTOM_API_SERVER))
 bot = Bot(token=BOT_TOKEN, session=session)
 
@@ -36,11 +35,13 @@ dp = Dispatcher(storage=MemoryStorage())
 class DonateForm(StatesGroup):
     amount = State()
 
+# Настройки поиска: расширяем и разрешаем ytsearch / scsearch (SoundCloud)
 YDL_SEARCH_OPTIONS = {
     'format': 'bestaudio/best',
     'default_search': 'ytsearch5',
     'noplaylist': True,
     'quiet': True,
+    'extract_flat': False,
 }
 
 YDL_DOWNLOAD_OPTIONS = {
@@ -56,7 +57,6 @@ YDL_DOWNLOAD_OPTIONS = {
 
 os.makedirs('downloads', exist_ok=True)
 
-# --- Веб-сервер для Render (держит порт открытым) ---
 async def handle_ping(request):
     return web.Response(text="Music Bot is alive!")
 
@@ -77,6 +77,13 @@ async def set_main_menu(bot: Bot):
     except Exception as e:
         log.warning(f"Could not set commands: {e}")
 
+def get_start_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📢 Подписаться на канал", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}")
+    builder.button(text="💖 Поддержать автора", callback_data="start_donate")
+    builder.adjust(1)
+    return builder
+
 def get_donate_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="💖 Поддержать автора", callback_data="start_donate")
@@ -85,13 +92,14 @@ def get_donate_keyboard():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    builder = get_donate_keyboard()
+    builder = get_start_keyboard()
     
     await message.answer(
-        "🎵 **Привет! Я музыкальный бот.**\n\n"
-        "Просто отправь мне название трека или имя исполнителя (например: *Scally Milano* или *Kizaru*), "
-        "и я найду для тебя музыку!\n\n"
-        "Если тебе нравится бот, ты всегда можешь поддержать разработчика кнопкой ниже 👇",
+        f"🎵 **Привет! Я музыкальный бот.**\n\n"
+        f"⚠️ **Обязательное условие:** перед использованием обязательно подпишись на наш канал: **{CHANNEL_USERNAME}**!\n\n"
+        f"Просто отправь мне название трека или имя исполнителя (например: *Scally Milano*), "
+        f"и я найду для тебя музыку в YouTube, SoundCloud и Сети!\n\n"
+        f"Если тебе нравится бот, ты всегда можешь поддержать разработчика кнопкой ниже 👇",
         reply_markup=builder.as_markup(),
         parse_mode="Markdown"
     )
@@ -155,25 +163,53 @@ async def search_music(message: types.Message):
     if not query or query.startswith("/"):
         return
 
-    wait_msg = await message.answer("🔍 Ищу треки в Сети...")
+    wait_msg = await message.answer("🔍 Ищу треки в YouTube, SoundCloud и Сети...")
 
     try:
         def run_search():
-            with yt_dlp.YoutubeDL(YDL_SEARCH_OPTIONS) as ydl:
-                info = ydl.extract_info(query, download=False)
-                return info.get('entries', [])
+            entries = []
+            # Пробуем поиск через YouTube
+            try:
+                with yt_dlp.YoutubeDL(YDL_SEARCH_OPTIONS) as ydl:
+                    info = ydl.extract_info(f"ytsearch5:{query}", download=False)
+                    entries = info.get('entries', [])
+            except Exception:
+                pass
+            
+            # Если в ютубе пусто, пробуем SoundCloud
+            if not entries:
+                try:
+                    sc_options = YDL_SEARCH_OPTIONS.copy()
+                    sc_options['default_search'] = 'scsearch5'
+                    with yt_dlp.YoutubeDL(sc_options) as ydl:
+                        info = ydl.extract_info(f"scsearch5:{query}", download=False)
+                        entries = info.get('entries', [])
+                except Exception:
+                    pass
+            return entries
 
         entries = await asyncio.to_thread(run_search)
 
         if not entries:
-            await wait_msg.edit_text("❌ Ничего не найдено по твоему запросу.")
+            await wait_msg.edit_text("❌ Ничего не найдено по твоему запросу в Сети. Попробуй написать точнее!")
             return
 
         builder = InlineKeyboardBuilder()
         for entry in entries[:5]:
+            if not entry:
+                continue
             title = entry.get('title', 'Unknown Title')
-            duration = entry.get('duration_string', '??:??')
-            video_id = entry.get('id')
+            duration_sec = entry.get('duration')
+            if duration_sec:
+                mins = int(duration_sec) // 60
+                secs = int(duration_sec) % 60
+                duration = f"{mins}:{secs:02d}"
+            else:
+                duration = "??:??"
+            
+            video_id = entry.get('id') or entry.get('url')
+            if not video_id:
+                continue
             
             btn_text = f"🎵 {title[:35]} ({duration})"
             builder.button(text=btn_text, callback_data=f"dl_{video_id}")
@@ -193,8 +229,12 @@ async def search_music(message: types.Message):
 
 @dp.callback_query(F.data.startswith("dl_"))
 async def download_track(callback: types.CallbackQuery):
-    video_id = callback.data.split("_")[1]
-    url = f"https://www.youtube.com/watch?v={video_id}"
+    target = callback.data.split("_", 1)[1]
+    
+    if target.startswith("http"):
+        url = target
+    else:
+        url = f"https://www.youtube.com/watch?v={target}"
 
     await callback.message.edit_text("📥 Скачиваю трек и конвертирую в MP3...")
 
@@ -215,7 +255,7 @@ async def download_track(callback: types.CallbackQuery):
             
             await callback.message.answer_audio(
                 audio=audio_file,
-                caption=f"🎧 `{title}`",
+                caption=f"🎧 `{title}`\n\n📢 Канал автора: {CHANNEL_USERNAME}",
                 reply_markup=builder.as_markup(),
                 parse_mode="Markdown"
             )
@@ -237,7 +277,7 @@ async def download_track(callback: types.CallbackQuery):
 async def main():
     await start_dummy_server()
     await set_main_menu(bot)
-    log.info("🎵 Музыкальный бот запущен через кастомный API!")
+    log.info("🎵 Музыкальный бот с мульти-поиском запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
