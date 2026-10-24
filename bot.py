@@ -7,7 +7,9 @@ import asyncio
 import subprocess
 import logging
 import sys
+import json
 from collections import OrderedDict
+from urllib.parse import quote
 
 
 def _ensure_latest_ytdlp():
@@ -28,7 +30,7 @@ def _ensure_latest_ytdlp():
 _ensure_latest_ytdlp()
 
 import yt_dlp  # noqa: E402
-from aiohttp import web, ClientSession, ClientTimeout  # noqa: E402
+from aiohttp import web, ClientSession, ClientTimeout, FormData  # noqa: E402
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -132,7 +134,11 @@ async def handle_file(request):
     full = os.path.join(DOWNLOAD_DIR, name)
     if not re.fullmatch(r"[\w.\-]+", name) or not os.path.isfile(full):
         raise web.HTTPNotFound()
-    return web.FileResponse(full)
+    ext = os.path.splitext(name)[1] or ".mp3"
+    title = re.sub(r'[\\/:*?"<>|]', "", request.query.get("t", "track")).strip() or "track"
+    resp = web.FileResponse(full)
+    resp.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(title + ext)}"
+    return resp
 
 
 async def start_web_server():
@@ -618,8 +624,71 @@ async def on_search(message: types.Message, state: FSMContext):
 
 
 # ---------- Скачивание ----------
+async def to_clean_mp3(path: str, prefix: str) -> str:
+    """Перекодирует в стандартный MP3 128k (быстро, ~2–4 с). При сбое возвращает исходный файл."""
+    dst = f"{prefix}_final.mp3"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", path, "-vn", "-map_metadata", "-1",
+            "-c:a", "libmp3lame", "-b:a", "128k", dst,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=60)
+        if proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 10_000:
+            if dst != path:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            return dst
+    except Exception as e:
+        log.warning("ffmpeg convert failed: %s", e)
+    return path
+
+
+async def send_audio_direct(chat_id: int, path: str, item: dict, caption: str) -> dict:
+    """sendAudio напрямую через multipart: файл лежит в поле `audio` (формат из доков Catugram)."""
+    url = f"{CUSTOM_API_SERVER.rstrip('/')}/bot{BOT_TOKEN}/sendAudio"
+    form = FormData()
+    form.add_field("chat_id", str(chat_id))
+    form.add_field("caption", caption)
+    form.add_field("parse_mode", "HTML")
+    form.add_field("title", item["title"][:100])
+    if item.get("artist"):
+        form.add_field("performer", item["artist"][:100])
+    if item.get("duration"):
+        form.add_field("duration", str(int(item["duration"])))
+    form.add_field("reply_markup", json.dumps(
+        {"inline_keyboard": [[{"text": "💖 Поддержать автора", "callback_data": "start_donate"}]]},
+        ensure_ascii=False))
+    with open(path, "rb") as fh:
+        form.add_field("audio", fh, filename="track.mp3", content_type="audio/mpeg")
+        async with ClientSession(timeout=ClientTimeout(total=180)) as http:
+            async with http.post(url, data=form) as resp:
+                data = await resp.json(content_type=None)
+    if not data.get("ok"):
+        raise RuntimeError(f"{data.get('error_code')} {data.get('description')}")
+    return data.get("result") or {}
+
+
+async def _delayed_remove(path: str, delay: int):
+    await asyncio.sleep(delay)
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+_LAST_NOTIFY = 0.0
+
+
 async def notify_admin(text: str):
-    """Присылает админу подробности ошибки (чтобы видеть причину без логов Render)."""
+    """Присылает админу подробности ошибки (не чаще раза в 5 минут)."""
+    global _LAST_NOTIFY
+    now = asyncio.get_running_loop().time()
+    if now - _LAST_NOTIFY < 300:
+        return
+    _LAST_NOTIFY = now
     try:
         await bot.send_message(ADMIN_ID, f"🛠 <pre>{esc(text[:3500])}</pre>")
     except Exception as e:
@@ -654,6 +723,7 @@ async def cb_download(callback: types.CallbackQuery):
     status = await callback.message.answer(f"📥 Скачиваю: {esc(item['title'][:60])}...")
     prefix = os.path.join(DOWNLOAD_DIR, uuid.uuid4().hex)
     path = None
+    keep_file = False
     try:
         async with DL_SEM:
             path = await asyncio.wait_for(download_track(item, prefix), timeout=90)
@@ -662,49 +732,80 @@ async def cb_download(callback: types.CallbackQuery):
             await status.edit_text("❌ Не удалось скачать этот трек. Попробуй другой вариант.")
             return
 
+        # Всегда делаем чистый MP3 (ровные заголовки) — приватный сервер может
+        # отвергать «сырые» файлы (MEDIA_INVALID).
+        path = await to_clean_mp3(path, prefix)
         log.info("Sending %s (%d bytes)", path, os.path.getsize(path))
-        # Приватный API-сервер может не принимать загрузку файлов (FILE_ID_INVALID),
-        # поэтому сначала отдаём ссылку на файл, потом пробуем обычную загрузку.
-        attempts = []
+        chat_id = callback.message.chat.id
+
+        async def _via_direct():
+            # Как в документации Catugram: файл прямо в поле audio (без attach://)
+            res = await send_audio_direct(chat_id, path, item, caption)
+            return (res.get("audio") or {}).get("file_id")
+
+        async def _via_url():
+            msg = await callback.message.answer_audio(
+                audio=f"{PUBLIC_BASE}/dl/{os.path.basename(path)}",
+                title=item["title"][:100],
+                performer=(item.get("artist") or "")[:100] or None,
+                duration=int(item["duration"]) if item.get("duration") else None,
+                caption=caption,
+                reply_markup=donate_keyboard(),
+            )
+            return msg.audio.file_id if msg.audio else None
+
+        async def _via_aiogram():
+            msg = await callback.message.answer_audio(
+                audio=types.FSInputFile(path),
+                title=item["title"][:100],
+                performer=(item.get("artist") or "")[:100] or None,
+                duration=int(item["duration"]) if item.get("duration") else None,
+                caption=caption,
+                reply_markup=donate_keyboard(),
+            )
+            return msg.audio.file_id if msg.audio else None
+
+        methods = [("direct-upload", _via_direct)]
         if PUBLIC_BASE:
-            attempts.append(("url", f"{PUBLIC_BASE}/dl/{os.path.basename(path)}"))
-        attempts.append(("upload", types.FSInputFile(path)))
+            methods.append(("url", _via_url))
+        methods.append(("aiogram-upload", _via_aiogram))
 
         sent = None
+        file_id = None
         errors = []
-        for method, src in attempts:
+        for method, fn in methods:
             try:
-                sent = await callback.message.answer_audio(
-                    audio=src,
-                    title=item["title"][:100],
-                    performer=(item.get("artist") or "")[:100] or None,
-                    duration=int(item["duration"]) if item.get("duration") else None,
-                    caption=caption,
-                    reply_markup=donate_keyboard(),
-                )
+                file_id = await fn()
+                sent = "ok"
                 log.info("Sent via %s", method)
                 break
             except Exception as send_err:
                 log.warning("send via %s failed: %s", method, send_err)
                 errors.append(f"{method}: {type(send_err).__name__}: {send_err}")
-        if sent is None:
-            try:
-                sent = await callback.message.answer_document(
-                    document=types.FSInputFile(path),
-                    caption=caption,
-                    reply_markup=donate_keyboard(),
-                )
-            except Exception as doc_err:
-                errors.append(f"document: {type(doc_err).__name__}: {doc_err}")
+        if sent is None and PUBLIC_BASE:
+            # Приватный сервер не принимает файлы -> даём прямую ссылку на MP3
+            link = f"{PUBLIC_BASE}/dl/{os.path.basename(path)}?t={quote(item['title'][:80])}"
+            lb = InlineKeyboardBuilder()
+            lb.button(text="⬇️ Скачать MP3", url=link)
+            lb.button(text="💖 Поддержать автора", callback_data="start_donate")
+            lb.adjust(1)
+            await callback.message.answer(
+                f"🎧 <b>{esc(item['title'])}</b>\n"
+                f"⏱ {fmt_duration(item['duration'])}\n\n"
+                "Трек готов! Нажми кнопку ниже — файл скачается прямо на телефон.\n"
+                "⏳ Ссылка действует 30 минут.\n\n"
+                f"📢 {esc(CHANNEL_USERNAME)}",
+                reply_markup=lb.as_markup(),
+            )
+            keep_file = True
+            asyncio.create_task(_delayed_remove(path, 1800))
+            sent = "link"
         if errors:
-            hint = "" if PUBLIC_BASE else "\nPUBLIC_BASE пуст: задай PUBLIC_URL=https://<твой-сервис>.onrender.com"
-            await notify_admin("Отправка трека:\n" + "\n".join(errors) + hint)
+            await notify_admin("Отправка трека (использована ссылка):\n" + "\n".join(errors))
         if sent is None:
-            raise RuntimeError("не удалось отправить файл ни одним способом")
-        try:
-            FILE_ID_CACHE[key] = sent.audio.file_id
-        except Exception:
-            pass
+            raise RuntimeError("не удалось отправить файл (PUBLIC_URL не задан)")
+        if sent == "ok" and file_id:
+            FILE_ID_CACHE[key] = file_id
         try:
             await status.delete()
         except Exception:
@@ -723,11 +824,12 @@ async def cb_download(callback: types.CallbackQuery):
         except Exception:
             pass
     finally:
-        for f in glob.glob(f"{prefix}*"):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
+        if not keep_file:
+            for f in glob.glob(f"{prefix}*"):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
 
 
 # ---------- Запуск ----------
