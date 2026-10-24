@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 from aiohttp import web
-import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -48,7 +47,7 @@ YDL_DOWNLOAD_OPTIONS = {
 
 os.makedirs('downloads', exist_ok=True)
 
-# --- Сервер-заглушка для Render ---
+# --- Веб-сервер для Render (держит порт открытым) ---
 async def handle_ping(request):
     return web.Response(text="Music Bot is alive!")
 
@@ -59,19 +58,6 @@ async def start_dummy_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-
-# --- Авто-пинг каждые 5 минут, чтобы Render не уходил в сон ---
-async def keep_alive():
-    url = os.getenv("RENDER_EXTERNAL_URL")
-    if not url:
-        return
-    async with aiohttp.ClientSession() as sess:
-        while True:
-            await asyncio.sleep(300)
-            try:
-                await sess.get(url, timeout=aiohttp.ClientTimeout(total=15))
-            except Exception as e:
-                log.warning("keep_alive error: %s", e)
 
 async def set_main_menu(bot: Bot):
     commands = [
@@ -238,11 +224,9 @@ async def download_track(callback: types.CallbackQuery):
 
 async def main():
     await start_dummy_server()
-    asyncio.create_task(keep_alive())
     await set_main_menu(bot)
     log.info("🎵 Музыкальный бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
