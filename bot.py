@@ -713,7 +713,7 @@ async def on_search(message: types.Message, state: FSMContext):
 # Сервер Catugram принимает только небольшие файлы (~1–1.5 МБ; в доках 25 МиБ, на деле меньше)
 # и отвергает sendAudio (MEDIA_INVALID) — работает sendDocument. Лимит можно поднять
 # переменной окружения DOC_MAX_BYTES после теста командой /probedoc.
-DOC_MAX_BYTES = int(os.getenv("DOC_MAX_BYTES", "1000000"))
+DOC_MAX_BYTES = int(os.getenv("DOC_MAX_BYTES", "893802"))  # по тесту /probedoc: 969 КБ ок, 1500 КБ уже FILE_ID_INVALID
 TRY_AUDIO = os.getenv("TRY_AUDIO", "0") == "1"  # пробовать sendAudio (сейчас не работает)
 
 
@@ -998,6 +998,41 @@ async def cb_download(callback: types.CallbackQuery):
                                 f"{ascii_name}.mp3", "audio/mpeg", extra)
             return None
 
+        FILEID_AUDIO_OK = {"v": True}  # если сервер ни разу не принял — больше не пробуем
+
+        async def _via_docid_audio():
+            # Трюк: sendDocument работает, sendAudio с загрузкой — нет (MEDIA_INVALID).
+            # Грузим mp3 документом админу (тихо), берём file_id и шлём sendAudio по file_id.
+            if not FILEID_AUDIO_OK["v"]:
+                raise RuntimeError("docid-audio отключён (сервер не принял ранее)")
+            doc = await post_file("sendDocument", "document", ADMIN_ID, path,
+                                  "track.mp3", "audio/mpeg", {"disable_notification": "true"})
+            fid = (doc.get("document") or {}).get("file_id")
+            if not fid:
+                raise RuntimeError("нет file_id у документа")
+            payload = {"chat_id": chat_id, "audio": fid,
+                       "title": item["title"][:100],
+                       "reply_markup": json.dumps(
+                           {"inline_keyboard": [[{"text": "💖 Поддержать автора",
+                                                  "callback_data": "start_donate"}]]},
+                           ensure_ascii=False)}
+            if item.get("artist"):
+                payload["performer"] = item["artist"][:100]
+            if item.get("duration"):
+                payload["duration"] = int(item["duration"])
+            if caption:
+                payload["caption"] = caption
+                payload["parse_mode"] = "HTML"
+            url = f"{CUSTOM_API_SERVER.rstrip('/')}/bot{BOT_TOKEN}/sendAudio"
+            async with ClientSession(timeout=ClientTimeout(total=60)) as http:
+                async with http.post(url, data=payload) as resp:
+                    data = json.loads(await resp.text())
+            if not data.get("ok"):
+                if "MEDIA_INVALID" in str(data.get("description")) or "FILE_ID" in str(data.get("description")):
+                    FILEID_AUDIO_OK["v"] = False
+                raise RuntimeError(f"{data.get('error_code')} {data.get('description')}")
+            return ((data.get("result") or {}).get("audio") or {}).get("file_id")
+
         methods = []
         if TRY_AUDIO:
             methods.append(("direct-upload", _via_direct))
@@ -1005,6 +1040,7 @@ async def cb_download(callback: types.CallbackQuery):
                 methods.append(("url", _via_url))
             methods.append(("aiogram-upload", _via_aiogram))
         if use_doc:
+            methods.append(("docid-audio", _via_docid_audio))
             methods.append(("document", _via_document))
 
         sent = None
