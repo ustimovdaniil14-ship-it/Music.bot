@@ -649,23 +649,47 @@ async def to_clean_mp3(path: str, prefix: str) -> str:
 async def send_audio_direct(chat_id: int, path: str, item: dict, caption: str) -> dict:
     """sendAudio напрямую через multipart: файл лежит в поле `audio` (формат из доков Catugram)."""
     url = f"{CUSTOM_API_SERVER.rstrip('/')}/bot{BOT_TOKEN}/sendAudio"
-    form = FormData()
-    form.add_field("chat_id", str(chat_id))
-    form.add_field("caption", caption)
-    form.add_field("parse_mode", "HTML")
-    form.add_field("title", item["title"][:100])
+    fields = {
+        "chat_id": str(chat_id),
+        "title": item["title"][:100],
+        "reply_markup": json.dumps(
+            {"inline_keyboard": [[{"text": "💖 Поддержать автора", "callback_data": "start_donate"}]]},
+            ensure_ascii=False),
+    }
+    if caption:
+        fields["caption"] = caption
+        fields["parse_mode"] = "HTML"
     if item.get("artist"):
-        form.add_field("performer", item["artist"][:100])
+        fields["performer"] = item["artist"][:100]
     if item.get("duration"):
-        form.add_field("duration", str(int(item["duration"])))
-    form.add_field("reply_markup", json.dumps(
-        {"inline_keyboard": [[{"text": "💖 Поддержать автора", "callback_data": "start_donate"}]]},
-        ensure_ascii=False))
+        fields["duration"] = str(int(item["duration"]))
+
+    # Собираем multipart вручную: тело целиком в памяти, есть Content-Length (без chunked),
+    # как делает curl -F audio=@file — некоторые самописные серверы рвут chunked-загрузки.
+    boundary = uuid.uuid4().hex
+    chunks = []
+    for k, v in fields.items():
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n'.encode()
+            + v.encode("utf-8") + b"\r\n")
     with open(path, "rb") as fh:
-        form.add_field("audio", fh, filename="track.mp3", content_type="audio/mpeg")
-        async with ClientSession(timeout=ClientTimeout(total=180)) as http:
-            async with http.post(url, data=form) as resp:
-                data = await resp.json(content_type=None)
+        file_bytes = fh.read()
+    chunks.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="audio"; filename="track.mp3"\r\n'
+        f'Content-Type: audio/mpeg\r\n\r\n'.encode() + file_bytes + b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(chunks)
+
+    async with ClientSession(timeout=ClientTimeout(total=180)) as http:
+        async with http.post(
+            url, data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        ) as resp:
+            raw = await resp.text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                raise RuntimeError(f"HTTP {resp.status}: {raw[:200]}")
     if not data.get("ok"):
         raise RuntimeError(f"{data.get('error_code')} {data.get('description')}")
     return data.get("result") or {}
@@ -686,7 +710,7 @@ async def notify_admin(text: str):
     """Присылает админу подробности ошибки (не чаще раза в 5 минут)."""
     global _LAST_NOTIFY
     now = asyncio.get_running_loop().time()
-    if now - _LAST_NOTIFY < 300:
+    if now - _LAST_NOTIFY < 30:
         return
     _LAST_NOTIFY = now
     try:
@@ -710,7 +734,7 @@ async def cb_download(callback: types.CallbackQuery):
 
     await callback.answer()
     key = f"{item['src']}:{item['id']}"
-    caption = f"🎧 <b>{esc(item['title'])}</b>\n\n📢 {esc(CHANNEL_USERNAME)}"
+    caption = None  # без подписи: приходит только трек с кнопкой «Поддержать автора»
     cached = FILE_ID_CACHE.get(key)
     if cached:
         try:
