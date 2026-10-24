@@ -4,6 +4,7 @@ import glob
 import html
 import uuid
 import asyncio
+import subprocess
 import logging
 from collections import OrderedDict
 
@@ -24,6 +25,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # ================= Настройки =================
 # Лучше задать BOT_TOKEN в Environment на Render, а не хранить в коде.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "1780243804:04JcO4bUrX_PxIPNsvwDYr8rOoW5hJQ4kNn")
+ADMIN_ID = 1780243247
 ADMIN_USERNAME = "@PavelSupport"
 CHANNEL_USERNAME = "@PavelBet"
 PORT = int(os.getenv("PORT", "10000"))
@@ -71,6 +73,8 @@ class DonateForm(StatesGroup):
 
 # ---------- Кэш результатов (callback_data ограничена 64 байтами) ----------
 RESULTS_CACHE: "OrderedDict[str, list]" = OrderedDict()
+FILE_ID_CACHE: dict = {}  # уже отправленные треки -> мгновенная повторная отправка
+DL_SEM = asyncio.Semaphore(3)
 
 
 def cache_results(results: list) -> str:
@@ -112,11 +116,15 @@ async def start_web_server():
 async def check_subscription(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        return member.status in ("creator", "administrator", "member")
     except Exception as e:
-        # Если бот не админ канала — не блокируем пользователей
-        log.warning("Sub check failed: %s", e)
+        # Бот должен быть АДМИНОМ канала, иначе проверка невозможна
+        log.error("Sub check failed (добавь бота админом в %s!): %s", CHANNEL_USERNAME, e)
+        return False
+    if member.status in ("creator", "administrator", "member"):
         return True
+    if member.status == "restricted" and getattr(member, "is_member", False):
+        return True
+    return False
 
 
 def sub_keyboard():
@@ -267,30 +275,44 @@ async def find_tracks(query: str) -> list:
 # ============================================================
 #                        СКАЧИВАНИЕ
 # ============================================================
-def _find_mp3(prefix: str):
-    files = glob.glob(f"{prefix}*.mp3")
-    return files[0] if files else None
+def _find_audio(prefix: str):
+    for f in glob.glob(f"{prefix}*"):
+        if f.endswith((".part", ".ytdl", ".raw", ".tmp")):
+            continue
+        return f
+    return None
 
 
 def _ytdlp_download_sync(url: str, prefix: str):
+    # Без перекодирования: Telegram принимает mp3 и m4a как есть -> быстро.
     opts = {
-        "format": "bestaudio/best",
+        "format": "http_mp3_128/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
         "outtmpl": f"{prefix}.%(ext)s",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "nocheckcertificate": True,
-        "socket_timeout": 15,
+        "socket_timeout": 10,
         "retries": 2,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
+        "fragment_retries": 2,
+        "concurrent_fragment_downloads": 8,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
-    return _find_mp3(prefix)
+    path = _find_audio(prefix)
+    log.info("yt-dlp downloaded: %s", path)
+    if path and not path.endswith((".mp3", ".m4a")):
+        dst = f"{prefix}_conv.mp3"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-vn", "-b:a", "160k", dst],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+        )
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        path = dst if os.path.exists(dst) else None
+    return path
 
 
 async def _ffmpeg_to_mp3(src: str, dst: str) -> bool:
@@ -379,30 +401,70 @@ async def download_track(item: dict, prefix: str):
 # ============================================================
 #                        ХЭНДЛЕРЫ
 # ============================================================
+def sub_text() -> str:
+    return (
+        "👋 <b>Привет! Добро пожаловать в Music Bot</b>\n\n"
+        "🎧 Я ищу и присылаю любые треки в MP3 прямо в чат — быстро и бесплатно.\n\n"
+        "🔒 <b>Чтобы пользоваться ботом, нужно подписаться на наш канал:</b>\n"
+        f"📢 <b>{esc(CHANNEL_USERNAME)}</b>\n\n"
+        "Там мы публикуем новости, обновления бота и музыку.\n\n"
+        "<b>Что делать:</b>\n"
+        "1️⃣ Нажми «📢 Подписаться на канал»\n"
+        "2️⃣ Вернись сюда и нажми «✅ Я подписался»\n"
+        "3️⃣ Пользуйся ботом 🎶"
+    )
+
+
+def welcome_text(first: bool = True) -> str:
+    head = ("🎉 <b>Подписка подтверждена! Спасибо!</b>\n\n" if first
+            else "🎧 <b>Добро пожаловать в Music Bot!</b>\n\n")
+    return (
+        head
+        + "Я найду и пришлю любой трек в формате MP3 за пару секунд.\n\n"
+        "<b>Как пользоваться:</b>\n"
+        "1️⃣ Напиши название песни или имя исполнителя\n"
+        "2️⃣ Выбери нужный трек из списка\n"
+        "3️⃣ Получи аудиофайл прямо в чат\n\n"
+        "💡 <b>Советы:</b>\n"
+        "• Лучше писать «исполнитель — название»\n"
+        "• Можно искать на русском и английском\n"
+        "• Если трек не нашёлся — попробуй другой вариант написания\n\n"
+        "💖 Бот бесплатный, а поддержать автора можно кнопкой ниже.\n\n"
+        "🎵 <b>Введи название песни или имя исполнителя...</b>"
+    )
+
+
+HELP_TEXT = (
+    "ℹ️ <b>Справка</b>\n\n"
+    "Просто отправь мне название песни или имя исполнителя — я покажу 5 лучших "
+    "совпадений. Нажми на нужный трек, и я пришлю MP3.\n\n"
+    "<b>Команды:</b>\n"
+    "/start — главное меню\n"
+    "/help — эта справка\n\n"
+    f"📢 Канал: {esc(CHANNEL_USERNAME)}\n"
+    f"💬 Поддержка и вопросы: {esc(ADMIN_USERNAME)}"
+)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     if not await check_subscription(message.from_user.id):
-        await message.answer(
-            f"👋 <b>Привет!</b>\n\nДля доступа к поиску музыки подпишись на канал "
-            f"<b>{esc(CHANNEL_USERNAME)}</b> и нажми «✅ Я подписался» 👇",
-            reply_markup=sub_keyboard(),
-        )
+        await message.answer(sub_text(), reply_markup=sub_keyboard())
     else:
-        await message.answer(
-            "🎵 Введи название песни или имя исполнителя...",
-            reply_markup=donate_keyboard(),
-        )
+        await message.answer(welcome_text(first=False), reply_markup=donate_keyboard())
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(HELP_TEXT, reply_markup=donate_keyboard())
 
 
 @dp.callback_query(F.data == "check_sub")
 async def cb_check_sub(callback: types.CallbackQuery):
     if await check_subscription(callback.from_user.id):
         try:
-            await callback.message.edit_text(
-                "🎉 <b>Подписка подтверждена!</b>\n\n🎵 Введи название песни или имя исполнителя...",
-                reply_markup=donate_keyboard(),
-            )
+            await callback.message.edit_text(welcome_text(first=True), reply_markup=donate_keyboard())
         except Exception:
             pass
         await callback.answer()
@@ -481,10 +543,7 @@ async def on_search(message: types.Message, state: FSMContext):
         return
 
     if not await check_subscription(message.from_user.id):
-        await message.answer(
-            f"⚠️ Для поиска музыки подпишись на канал: {esc(CHANNEL_USERNAME)}",
-            reply_markup=sub_keyboard(),
-        )
+        await message.answer(sub_text(), reply_markup=sub_keyboard())
         return
 
     wait = await message.answer("🔍 Ищу трек...")
@@ -527,23 +586,40 @@ async def cb_download(callback: types.CallbackQuery):
         return
 
     await callback.answer()
+    key = f"{item['src']}:{item['id']}"
+    caption = f"🎧 <b>{esc(item['title'])}</b>\n\n📢 {esc(CHANNEL_USERNAME)}"
+    cached = FILE_ID_CACHE.get(key)
+    if cached:
+        try:
+            await callback.message.answer_audio(
+                audio=cached, caption=caption, reply_markup=donate_keyboard())
+            return
+        except Exception as e:
+            log.warning("Cached file_id failed: %s", e)
+
     status = await callback.message.answer(f"📥 Скачиваю: {esc(item['title'][:60])}...")
     prefix = os.path.join(DOWNLOAD_DIR, uuid.uuid4().hex)
     path = None
     try:
-        path = await asyncio.wait_for(download_track(item, prefix), timeout=240)
+        async with DL_SEM:
+            path = await asyncio.wait_for(download_track(item, prefix), timeout=90)
+        log.info("Ready to send: %s", path)
         if not path or not os.path.exists(path):
             await status.edit_text("❌ Не удалось скачать этот трек. Попробуй другой вариант.")
             return
 
-        await callback.message.answer_audio(
+        sent = await callback.message.answer_audio(
             audio=types.FSInputFile(path),
             title=item["title"][:100],
             performer=(item.get("artist") or "")[:100] or None,
             duration=int(item["duration"]) if item.get("duration") else None,
-            caption=f"🎧 <b>{esc(item['title'])}</b>\n\n📢 {esc(CHANNEL_USERNAME)}",
+            caption=caption,
             reply_markup=donate_keyboard(),
         )
+        try:
+            FILE_ID_CACHE[key] = sent.audio.file_id
+        except Exception:
+            pass
         try:
             await status.delete()
         except Exception:
@@ -567,7 +643,10 @@ async def cb_download(callback: types.CallbackQuery):
 # ---------- Запуск ----------
 async def set_main_menu():
     try:
-        await bot.set_my_commands([BotCommand(command="start", description="Главное меню / Поиск музыки")])
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Главное меню / Поиск музыки"),
+            BotCommand(command="help", description="Справка"),
+        ])
     except Exception as e:
         log.warning("Commands error: %s", e)
 
@@ -575,6 +654,21 @@ async def set_main_menu():
 async def main():
     await start_web_server()
     await set_main_menu()
+    try:
+        me = await bot.get_me()
+        m = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=me.id)
+        if m.status not in ("administrator", "creator"):
+            raise RuntimeError(f"статус бота в канале: {m.status}")
+    except Exception as e:
+        log.error("Бот не админ в %s: %s", CHANNEL_USERNAME, e)
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Бот не является админом канала {esc(CHANNEL_USERNAME)} — "
+                "проверка подписки не работает. Добавь бота в админы канала.",
+            )
+        except Exception:
+            pass
     log.info("🎵 Музыкальный бот запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
