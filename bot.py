@@ -3,6 +3,8 @@ import asyncio
 import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
@@ -16,12 +18,19 @@ BOT_TOKEN = "1780243804:04JcO4bUrX_PxIPNsvwDYr8rOoW5hJQ4kNn"
 ADMIN_ID = 1780243247
 ADMIN_USERNAME = "@PavelSupport"
 PORT = int(os.getenv("PORT", "10000"))
+
+# Кастомный сервер (твоя приватка)
+CUSTOM_API_SERVER = "https://bot.catup.lol/"
 # =============================================
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("music_bot")
 
-bot = Bot(token=BOT_TOKEN)
+# Настраиваем сессию для работы через ваш сервер (если используется Local Bot API)
+# Если бот должен стучаться напрямую через кастомный сервер:
+session = AiohttpSession(api=TelegramAPIServer.from_base(CUSTOM_API_SERVER))
+bot = Bot(token=BOT_TOKEN, session=session)
+
 dp = Dispatcher(storage=MemoryStorage())
 
 class DonateForm(StatesGroup):
@@ -60,10 +69,13 @@ async def start_dummy_server():
     await site.start()
 
 async def set_main_menu(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="Главное меню / Поиск музыки"),
-    ]
-    await bot.set_my_commands(commands)
+    try:
+        commands = [
+            BotCommand(command="start", description="Главное меню / Поиск музыки"),
+        ]
+        await bot.set_my_commands(commands)
+    except Exception as e:
+        log.warning(f"Could not set commands: {e}")
 
 def get_donate_keyboard():
     builder = InlineKeyboardBuilder()
@@ -225,7 +237,7 @@ async def download_track(callback: types.CallbackQuery):
 async def main():
     await start_dummy_server()
     await set_main_menu(bot)
-    log.info("🎵 Музыкальный бот запущен!")
+    log.info("🎵 Музыкальный бот запущен через кастомный API!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
