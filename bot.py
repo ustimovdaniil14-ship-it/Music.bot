@@ -514,6 +514,39 @@ async def cmd_help(message: types.Message):
     await message.answer(HELP_TEXT, reply_markup=donate_keyboard())
 
 
+@dp.message(Command("probedoc"))
+async def cmd_probedoc(message: types.Message):
+    """Только для админа: ищет максимальный размер файла для sendDocument."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("🧪 Ищу максимальный размер файла (до минуты)...")
+    lines = []
+    best = 0
+    for kb, sec in ((500, 31), (1000, 62), (1500, 94), (2000, 125), (3000, 187), (5000, 312)):
+        p = os.path.join(DOWNLOAD_DIR, f"pd_{kb}.mp3")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", str(sec),
+                "-c:a", "libmp3lame", "-b:a", "128k", p,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), timeout=60)
+            size = os.path.getsize(p)
+            await post_file("sendDocument", "document", message.chat.id, p,
+                            "test.mp3", "audio/mpeg", {})
+            best = max(best, size)
+            lines.append(f"✅ {size // 1024} КБ")
+        except Exception as e:
+            lines.append(f"❌ ~{kb} КБ: {str(e)[:80]}")
+        finally:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    tip = (f"\n\nРекомендую задать в Render: DOC_MAX_BYTES={int(best * 0.9)}"
+           if best else "\n\nНи один размер не прошёл.")
+    await message.answer("<b>Итог:</b>\n" + "\n".join(lines) + tip)
+
+
 @dp.message(Command("probe"))
 async def cmd_probe(message: types.Message):
     """Только для админа: проверяет, файлы какого размера принимает сервер."""
@@ -677,13 +710,30 @@ async def on_search(message: types.Message, state: FSMContext):
 
 
 # ---------- Скачивание ----------
-async def to_clean_mp3(path: str, prefix: str) -> str:
-    """Перекодирует в стандартный MP3 128k (быстро, ~2–4 с). При сбое возвращает исходный файл."""
+# Сервер Catugram принимает только небольшие файлы (~1–1.5 МБ; в доках 25 МиБ, на деле меньше)
+# и отвергает sendAudio (MEDIA_INVALID) — работает sendDocument. Лимит можно поднять
+# переменной окружения DOC_MAX_BYTES после теста командой /probedoc.
+DOC_MAX_BYTES = int(os.getenv("DOC_MAX_BYTES", "1000000"))
+TRY_AUDIO = os.getenv("TRY_AUDIO", "0") == "1"  # пробовать sendAudio (сейчас не работает)
+
+
+def doc_kbps(duration) -> int:
+    """Битрейт, при котором трек влезает в DOC_MAX_BYTES (макс. 128 кбит/с)."""
+    d = max(int(duration or 180), 1)
+    return min(128, int(DOC_MAX_BYTES * 0.95 * 8 / 1000 / d))
+
+
+async def to_clean_mp3(path: str, prefix: str, kbps: int = 128) -> str:
+    """Перекодирует в стандартный MP3 (быстро, ~2–4 с). При сбое возвращает исходный файл."""
     dst = f"{prefix}_final.mp3"
+    args = ["ffmpeg", "-y", "-i", path, "-vn", "-map_metadata", "-1",
+            "-c:a", "libmp3lame", "-b:a", f"{kbps}k"]
+    if kbps <= 64:
+        args += ["-ac", "1"]
+    args.append(dst)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", path, "-vn", "-map_metadata", "-1",
-            "-c:a", "libmp3lame", "-b:a", "128k", dst,
+            *args,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await asyncio.wait_for(proc.wait(), timeout=60)
@@ -892,8 +942,11 @@ async def cb_download(callback: types.CallbackQuery):
 
         # Всегда делаем чистый MP3 (ровные заголовки) — приватный сервер может
         # отвергать «сырые» файлы (MEDIA_INVALID).
-        path = await to_clean_mp3(path, prefix)
-        log.info("Sending %s (%d bytes)", path, os.path.getsize(path))
+        kbps = doc_kbps(item.get("duration"))
+        use_doc = kbps >= 32  # слишком длинный трек не ужать до лимита -> сразу ссылка
+        path = await to_clean_mp3(path, prefix, kbps if use_doc else 128)
+        log.info("Sending %s (%d bytes, %s)", path, os.path.getsize(path),
+                 f"{kbps}k" if use_doc else "link-only")
         chat_id = callback.message.chat.id
 
         async def _via_direct():
@@ -925,19 +978,34 @@ async def cb_download(callback: types.CallbackQuery):
 
         async def _via_document():
             # Если «аудио» сервер не принимает — отправляем mp3 как файл (всё равно в чат)
-            safe = re.sub(r"[^A-Za-z0-9 _.\-]", "", item["title"]).strip()[:60] or "track"
-            await post_file(
-                "sendDocument", "document", chat_id, path, f"{safe}.mp3", "audio/mpeg",
-                {"reply_markup": json.dumps(
-                    {"inline_keyboard": [[{"text": "💖 Поддержать автора",
-                                           "callback_data": "start_donate"}]]},
-                    ensure_ascii=False)})
+            artist = (item.get("artist") or "").strip()
+            base = (f"{artist} - {item['title']}"
+                    if artist and artist.lower() not in item["title"].lower() else item["title"])
+            nice = re.sub(r'[\\/:*?"<>|\r\n]', "", base).strip()[:80] or "track"
+            ascii_name = re.sub(r"[^A-Za-z0-9 _.\-]", "", base).strip()[:60] or "track"
+            extra = {"reply_markup": json.dumps(
+                {"inline_keyboard": [[{"text": "💖 Поддержать автора",
+                                       "callback_data": "start_donate"}]]},
+                ensure_ascii=False)}
+            try:
+                await post_file("sendDocument", "document", chat_id, path,
+                                f"{nice}.mp3", "audio/mpeg", extra)
+            except Exception as doc_err:
+                if "FILE_ID_INVALID" in str(doc_err):
+                    raise
+                # возможно, сервер не любит не-ASCII в имени файла
+                await post_file("sendDocument", "document", chat_id, path,
+                                f"{ascii_name}.mp3", "audio/mpeg", extra)
             return None
 
-        methods = [("direct-upload", _via_direct), ("direct-document", _via_document)]
-        if PUBLIC_BASE:
-            methods.append(("url", _via_url))
-        methods.append(("aiogram-upload", _via_aiogram))
+        methods = []
+        if TRY_AUDIO:
+            methods.append(("direct-upload", _via_direct))
+            if PUBLIC_BASE:
+                methods.append(("url", _via_url))
+            methods.append(("aiogram-upload", _via_aiogram))
+        if use_doc:
+            methods.append(("document", _via_document))
 
         sent = None
         file_id = None
