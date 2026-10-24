@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+from aiohttp import web
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -11,16 +13,18 @@ from aiogram.types import BotCommand
 import yt_dlp
 
 # ================= Настройки =================
-BOT_TOKEN = "1780243804:04JcO4bUrX_PxIPNsvwDYr8rOoW5hJQ4kNn"
-ADMIN_ID = 1780243247  # Твой Telegram ID
-ADMIN_USERNAME = "@PavelSupport"  # Юзернейм для NFT
+BOT_TOKEN = os.getenv("BOT_TOKEN", "1780243804:04JcO4bUrX_PxIPNsvwDYr8rOoW5hJQ4kNn")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1780243247"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@PavelSupport")
+PORT = int(os.getenv("PORT", "10000"))
 # =============================================
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("music_bot")
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- Состояния для доната ---
 class DonateForm(StatesGroup):
     amount = State()
 
@@ -44,13 +48,37 @@ YDL_DOWNLOAD_OPTIONS = {
 
 os.makedirs('downloads', exist_ok=True)
 
+# --- Сервер-заглушка для Render ---
+async def handle_ping(request):
+    return web.Response(text="Music Bot is alive!")
+
+async def start_dummy_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+
+# --- Авто-пинг каждые 5 минут, чтобы Render не уходил в сон ---
+async def keep_alive():
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    async with aiohttp.ClientSession() as sess:
+        while True:
+            await asyncio.sleep(300)
+            try:
+                await sess.get(url, timeout=aiohttp.ClientTimeout(total=15))
+            except Exception as e:
+                log.warning("keep_alive error: %s", e)
+
 async def set_main_menu(bot: Bot):
     commands = [
         BotCommand(command="start", description="Главное меню / Поиск музыки"),
     ]
     await bot.set_my_commands(commands)
 
-# Кнопка поддержки
 def get_donate_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="💖 Поддержать автора", callback_data="start_donate")
@@ -70,7 +98,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# --- Логика Поддержки ---
 @dp.callback_query(F.data == "start_donate")
 async def process_start_donate(callback: types.CallbackQuery):
     builder = InlineKeyboardBuilder()
@@ -124,7 +151,6 @@ async def pre_checkout_handler(pre_checkout_query: types.PreCheckoutQuery):
 async def payment_success(message: types.Message):
     await message.answer("💖 **Огромное спасибо за вашу поддержку! Это вдохновляет развивать бота дальше.**")
 
-# --- Поиск и скачивание музыки ---
 @dp.message()
 async def search_music(message: types.Message):
     query = message.text.strip()
@@ -154,7 +180,6 @@ async def search_music(message: types.Message):
             btn_text = f"🎵 {title[:35]} ({duration})"
             builder.button(text=btn_text, callback_data=f"dl_{video_id}")
 
-        # Добавляем кнопку доната прямо под списком найденной музыки
         builder.button(text="💖 Поддержать автора", callback_data="start_donate")
         builder.adjust(1)
 
@@ -165,7 +190,7 @@ async def search_music(message: types.Message):
         )
 
     except Exception as e:
-        logging.error(f"Search error: {e}")
+        log.error(f"Search error: {e}")
         await wait_msg.edit_text("⚠️ Ошибка при поиске музыки. Попробуй другой запрос.")
 
 @dp.callback_query(F.data.startswith("dl_"))
@@ -201,7 +226,7 @@ async def download_track(callback: types.CallbackQuery):
             await callback.message.edit_text("❌ Не удалось скачать файл.")
 
     except Exception as e:
-        logging.error(f"Download error: {e}")
+        log.error(f"Download error: {e}")
         await callback.message.edit_text("⚠️ Ошибка при скачивании трека.")
     
     finally:
@@ -212,8 +237,10 @@ async def download_track(callback: types.CallbackQuery):
                 pass
 
 async def main():
+    await start_dummy_server()
+    asyncio.create_task(keep_alive())
     await set_main_menu(bot)
-    print("🎵 Музыкальный бот запущен!")
+    log.info("🎵 Музыкальный бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
