@@ -123,9 +123,22 @@ async def handle_ping(request):
     return web.Response(text="OK")
 
 
+PUBLIC_BASE = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
+
+async def handle_file(request):
+    """Отдаёт скачанный трек по HTTP — Telegram-сервер сам заберёт его по ссылке."""
+    name = os.path.basename(request.match_info["name"])
+    full = os.path.join(DOWNLOAD_DIR, name)
+    if not re.fullmatch(r"[\w.\-]+", name) or not os.path.isfile(full):
+        raise web.HTTPNotFound()
+    return web.FileResponse(full)
+
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
+    app.router.add_get("/dl/{name}", handle_file)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -649,29 +662,49 @@ async def cb_download(callback: types.CallbackQuery):
             await status.edit_text("❌ Не удалось скачать этот трек. Попробуй другой вариант.")
             return
 
-        log.info("Uploading %s (%d bytes)", path, os.path.getsize(path))
-        try:
-            sent = await callback.message.answer_audio(
-                audio=types.FSInputFile(path),
-                title=item["title"][:100],
-                performer=(item.get("artist") or "")[:100] or None,
-                duration=int(item["duration"]) if item.get("duration") else None,
-                caption=caption,
-                reply_markup=donate_keyboard(),
-            )
+        log.info("Sending %s (%d bytes)", path, os.path.getsize(path))
+        # Приватный API-сервер может не принимать загрузку файлов (FILE_ID_INVALID),
+        # поэтому сначала отдаём ссылку на файл, потом пробуем обычную загрузку.
+        attempts = []
+        if PUBLIC_BASE:
+            attempts.append(("url", f"{PUBLIC_BASE}/dl/{os.path.basename(path)}"))
+        attempts.append(("upload", types.FSInputFile(path)))
+
+        sent = None
+        errors = []
+        for method, src in attempts:
             try:
-                FILE_ID_CACHE[key] = sent.audio.file_id
-            except Exception:
-                pass
-        except Exception as send_err:
-            log.exception("answer_audio failed")
-            await notify_admin(f"send_audio failed: {type(send_err).__name__}: {send_err}")
-            # запасной вариант: отправить как обычный файл
-            await callback.message.answer_document(
-                document=types.FSInputFile(path),
-                caption=caption,
-                reply_markup=donate_keyboard(),
-            )
+                sent = await callback.message.answer_audio(
+                    audio=src,
+                    title=item["title"][:100],
+                    performer=(item.get("artist") or "")[:100] or None,
+                    duration=int(item["duration"]) if item.get("duration") else None,
+                    caption=caption,
+                    reply_markup=donate_keyboard(),
+                )
+                log.info("Sent via %s", method)
+                break
+            except Exception as send_err:
+                log.warning("send via %s failed: %s", method, send_err)
+                errors.append(f"{method}: {type(send_err).__name__}: {send_err}")
+        if sent is None:
+            try:
+                sent = await callback.message.answer_document(
+                    document=types.FSInputFile(path),
+                    caption=caption,
+                    reply_markup=donate_keyboard(),
+                )
+            except Exception as doc_err:
+                errors.append(f"document: {type(doc_err).__name__}: {doc_err}")
+        if errors:
+            hint = "" if PUBLIC_BASE else "\nPUBLIC_BASE пуст: задай PUBLIC_URL=https://<твой-сервис>.onrender.com"
+            await notify_admin("Отправка трека:\n" + "\n".join(errors) + hint)
+        if sent is None:
+            raise RuntimeError("не удалось отправить файл ни одним способом")
+        try:
+            FILE_ID_CACHE[key] = sent.audio.file_id
+        except Exception:
+            pass
         try:
             await status.delete()
         except Exception:
