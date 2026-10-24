@@ -12,12 +12,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 import yt_dlp
 
-# ================= Настройки =================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "1780243804:04JcO4bUrX_PxIPNsvwDYr8rOoW5hJQ4kNn")
+# ================= Настройки (из переменных Render) =================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1780243247"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@PavelSupport")
 PORT = int(os.getenv("PORT", "10000"))
-# =============================================
+# ====================================================================
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("music_bot")
