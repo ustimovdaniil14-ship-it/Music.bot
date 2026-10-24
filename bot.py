@@ -75,6 +75,7 @@ class DonateForm(StatesGroup):
 RESULTS_CACHE: "OrderedDict[str, list]" = OrderedDict()
 FILE_ID_CACHE: dict = {}  # уже отправленные треки -> мгновенная повторная отправка
 DL_SEM = asyncio.Semaphore(3)
+CONFIRMED_USERS: set = set()  # кто нажал «Я подписался» (сбрасывается при перезапуске)
 
 
 def cache_results(results: list) -> str:
@@ -114,17 +115,8 @@ async def start_web_server():
 
 # ---------- Подписка ----------
 async def check_subscription(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-    except Exception as e:
-        # Бот должен быть АДМИНОМ канала, иначе проверка невозможна
-        log.error("Sub check failed (добавь бота админом в %s!): %s", CHANNEL_USERNAME, e)
-        return False
-    if member.status in ("creator", "administrator", "member"):
-        return True
-    if member.status == "restricted" and getattr(member, "is_member", False):
-        return True
-    return False
+    # Мягкий режим: реальную подписку не проверяем, достаточно нажать «✅ Я подписался»
+    return user_id in CONFIRMED_USERS
 
 
 def sub_keyboard():
@@ -462,14 +454,12 @@ async def cmd_help(message: types.Message):
 
 @dp.callback_query(F.data == "check_sub")
 async def cb_check_sub(callback: types.CallbackQuery):
-    if await check_subscription(callback.from_user.id):
-        try:
-            await callback.message.edit_text(welcome_text(first=True), reply_markup=donate_keyboard())
-        except Exception:
-            pass
-        await callback.answer()
-    else:
-        await callback.answer("❌ Ты всё ещё не подписан на канал!", show_alert=True)
+    CONFIRMED_USERS.add(callback.from_user.id)
+    try:
+        await callback.message.edit_text(welcome_text(first=True), reply_markup=donate_keyboard())
+    except Exception:
+        pass
+    await callback.answer()
 
 
 # ---------- Донаты ----------
@@ -654,21 +644,6 @@ async def set_main_menu():
 async def main():
     await start_web_server()
     await set_main_menu()
-    try:
-        me = await bot.get_me()
-        m = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=me.id)
-        if m.status not in ("administrator", "creator"):
-            raise RuntimeError(f"статус бота в канале: {m.status}")
-    except Exception as e:
-        log.error("Бот не админ в %s: %s", CHANNEL_USERNAME, e)
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"⚠️ Бот не является админом канала {esc(CHANNEL_USERNAME)} — "
-                "проверка подписки не работает. Добавь бота в админы канала.",
-            )
-        except Exception:
-            pass
     log.info("🎵 Музыкальный бот запущен!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
