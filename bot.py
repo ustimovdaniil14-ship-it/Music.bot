@@ -6,10 +6,29 @@ import uuid
 import asyncio
 import subprocess
 import logging
+import sys
 from collections import OrderedDict
 
-import yt_dlp
-from aiohttp import web, ClientSession, ClientTimeout
+
+def _ensure_latest_ytdlp():
+    """SoundCloud/YouTube постоянно меняют API, старый yt-dlp перестаёт качать.
+    При каждом старте обновляем yt-dlp (отключить: AUTO_UPDATE_YTDLP=0)."""
+    if os.getenv("AUTO_UPDATE_YTDLP", "1") == "0":
+        return
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-U", "--quiet",
+             "--disable-pip-version-check", "yt-dlp"],
+            timeout=180, check=False,
+        )
+    except Exception as exc:
+        print(f"yt-dlp auto-update skipped: {exc}", flush=True)
+
+
+_ensure_latest_ytdlp()
+
+import yt_dlp  # noqa: E402
+from aiohttp import web, ClientSession, ClientTimeout  # noqa: E402
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -52,7 +71,7 @@ INVIDIOUS_INSTANCES = [
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("music_bot")
 
-session = AiohttpSession(api=TelegramAPIServer.from_base(CUSTOM_API_SERVER))
+session = AiohttpSession(api=TelegramAPIServer.from_base(CUSTOM_API_SERVER), timeout=300)
 bot = Bot(
     token=BOT_TOKEN,
     session=session,
@@ -275,24 +294,48 @@ def _find_audio(prefix: str):
     return None
 
 
+YDL_FORMATS = [
+    "http_mp3_128/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
+    "best",
+    None,  # формат по умолчанию yt-dlp
+]
+
+
 def _ytdlp_download_sync(url: str, prefix: str):
     # Без перекодирования: Telegram принимает mp3 и m4a как есть -> быстро.
-    opts = {
-        "format": "http_mp3_128/bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
-        "outtmpl": f"{prefix}.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "nocheckcertificate": True,
-        "socket_timeout": 10,
-        "retries": 2,
-        "fragment_retries": 2,
-        "concurrent_fragment_downloads": 8,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
-    path = _find_audio(prefix)
-    log.info("yt-dlp downloaded: %s", path)
+    path = None
+    last_err = None
+    for fmt in YDL_FORMATS:
+        for leftover in glob.glob(f"{prefix}*"):
+            try:
+                os.remove(leftover)
+            except Exception:
+                pass
+        opts = {
+            "outtmpl": f"{prefix}.%(ext)s",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "nocheckcertificate": True,
+            "socket_timeout": 10,
+            "retries": 2,
+            "fragment_retries": 2,
+            "concurrent_fragment_downloads": 8,
+        }
+        if fmt:
+            opts["format"] = fmt
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+            path = _find_audio(prefix)
+            if path:
+                break
+        except Exception as e:
+            last_err = e
+            log.warning("yt-dlp attempt (format=%s) failed: %s", fmt, e)
+    if not path and last_err:
+        raise last_err
+    log.info("yt-dlp %s downloaded: %s", getattr(yt_dlp.version, "__version__", "?"), path)
     if path and not path.endswith((".mp3", ".m4a")):
         dst = f"{prefix}_conv.mp3"
         subprocess.run(
@@ -562,6 +605,14 @@ async def on_search(message: types.Message, state: FSMContext):
 
 
 # ---------- Скачивание ----------
+async def notify_admin(text: str):
+    """Присылает админу подробности ошибки (чтобы видеть причину без логов Render)."""
+    try:
+        await bot.send_message(ADMIN_ID, f"🛠 <pre>{esc(text[:3500])}</pre>")
+    except Exception as e:
+        log.warning("notify_admin failed: %s", e)
+
+
 @dp.callback_query(F.data.startswith("dl:"))
 async def cb_download(callback: types.CallbackQuery):
     try:
@@ -598,18 +649,29 @@ async def cb_download(callback: types.CallbackQuery):
             await status.edit_text("❌ Не удалось скачать этот трек. Попробуй другой вариант.")
             return
 
-        sent = await callback.message.answer_audio(
-            audio=types.FSInputFile(path),
-            title=item["title"][:100],
-            performer=(item.get("artist") or "")[:100] or None,
-            duration=int(item["duration"]) if item.get("duration") else None,
-            caption=caption,
-            reply_markup=donate_keyboard(),
-        )
+        log.info("Uploading %s (%d bytes)", path, os.path.getsize(path))
         try:
-            FILE_ID_CACHE[key] = sent.audio.file_id
-        except Exception:
-            pass
+            sent = await callback.message.answer_audio(
+                audio=types.FSInputFile(path),
+                title=item["title"][:100],
+                performer=(item.get("artist") or "")[:100] or None,
+                duration=int(item["duration"]) if item.get("duration") else None,
+                caption=caption,
+                reply_markup=donate_keyboard(),
+            )
+            try:
+                FILE_ID_CACHE[key] = sent.audio.file_id
+            except Exception:
+                pass
+        except Exception as send_err:
+            log.exception("answer_audio failed")
+            await notify_admin(f"send_audio failed: {type(send_err).__name__}: {send_err}")
+            # запасной вариант: отправить как обычный файл
+            await callback.message.answer_document(
+                document=types.FSInputFile(path),
+                caption=caption,
+                reply_markup=donate_keyboard(),
+            )
         try:
             await status.delete()
         except Exception:
@@ -617,9 +679,14 @@ async def cb_download(callback: types.CallbackQuery):
     except asyncio.TimeoutError:
         await status.edit_text("⌛ Загрузка заняла слишком много времени. Попробуй другой трек.")
     except Exception as e:
-        log.error("Download error: %s", e)
+        log.exception("Download error")
+        reason = f"{type(e).__name__}: {e}"
+        await notify_admin(f"Ошибка скачивания «{item['title'][:60]}» ({item['src']}):\n{reason}")
+        text = "⚠️ Не удалось скачать этот трек. Попробуй другой вариант из списка."
+        if callback.from_user.id == ADMIN_ID:
+            text += f"\n\n<code>{esc(reason[:300])}</code>"
         try:
-            await status.edit_text("⚠️ Не удалось скачать этот трек.")
+            await status.edit_text(text)
         except Exception:
             pass
     finally:
