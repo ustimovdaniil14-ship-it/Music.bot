@@ -514,6 +514,34 @@ async def cmd_help(message: types.Message):
     await message.answer(HELP_TEXT, reply_markup=donate_keyboard())
 
 
+@dp.message(Command("probe"))
+async def cmd_probe(message: types.Message):
+    """Только для админа: проверяет, файлы какого размера принимает сервер."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("🧪 Проверяю, какие размеры файлов принимает сервер...")
+    lines = []
+    for kb, sec in ((100, 6), (500, 31), (1000, 62), (2000, 125), (4000, 250)):
+        p = os.path.join(DOWNLOAD_DIR, f"probe_{kb}.mp3")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                "-t", str(sec), "-b:a", "128k", p,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), timeout=60)
+            size = os.path.getsize(p)
+            await send_audio_direct(message.chat.id, p, {"title": f"probe {kb} KB"}, None)
+            lines.append(f"✅ {size // 1024} КБ — принят")
+        except Exception as e:
+            lines.append(f"❌ ~{kb} КБ — {str(e)[:120]}")
+        finally:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    await message.answer("<b>Итог:</b>\n" + "\n".join(lines))
+
+
 @dp.callback_query(F.data == "check_sub")
 async def cb_check_sub(callback: types.CallbackQuery):
     CONFIRMED_USERS.add(callback.from_user.id)
@@ -695,6 +723,54 @@ async def send_audio_direct(chat_id: int, path: str, item: dict, caption: str) -
     return data.get("result") or {}
 
 
+UPLOAD_FAIL_BYTES = None  # минимальный размер файла, который сервер отверг (FILE_ID_INVALID)
+
+
+async def _reencode(src: str, dst: str, kbps: int) -> bool:
+    args = ["ffmpeg", "-y", "-i", src, "-vn", "-map_metadata", "-1",
+            "-c:a", "libmp3lame", "-b:a", f"{kbps}k"]
+    if kbps <= 64:
+        args += ["-ac", "1"]
+    args.append(dst)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await asyncio.wait_for(proc.wait(), timeout=60)
+        return proc.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 5000
+    except Exception as e:
+        log.warning("reencode failed: %s", e)
+        return False
+
+
+async def send_direct_adaptive(chat_id: int, path: str, item: dict, caption, prefix: str) -> dict:
+    """Загрузка файла напрямую. Если сервер отвергает большой файл (FILE_ID_INVALID —
+    так ведёт себя обрезанное тело запроса), пробуем меньший битрейт и запоминаем лимит."""
+    global UPLOAD_FAIL_BYTES
+    dur = item.get("duration") or 180
+    kbps = 128
+    if UPLOAD_FAIL_BYTES:
+        kbps = int(min(128, max(32, UPLOAD_FAIL_BYTES * 0.8 * 8 / 1000 / dur)))
+    while True:
+        cur = path
+        if kbps < 128:
+            dst = f"{prefix}_{kbps}k.mp3"
+            if await _reencode(path, dst, kbps):
+                cur = dst
+        size = os.path.getsize(cur)
+        try:
+            res = await send_audio_direct(chat_id, cur, item, caption)
+            log.info("direct upload ok: %d bytes @ %dk", size, kbps)
+            if UPLOAD_FAIL_BYTES and size >= UPLOAD_FAIL_BYTES:
+                UPLOAD_FAIL_BYTES = None  # лимит оказался ложным
+            return res
+        except Exception as e:
+            if "FILE_ID_INVALID" not in str(e) or kbps <= 32:
+                raise
+            UPLOAD_FAIL_BYTES = size if UPLOAD_FAIL_BYTES is None else min(UPLOAD_FAIL_BYTES, size)
+            log.warning("direct upload rejected at %d bytes (%dk), retrying smaller", size, kbps)
+            kbps = max(32, kbps // 2)
+
+
 async def _delayed_remove(path: str, delay: int):
     await asyncio.sleep(delay)
     try:
@@ -764,7 +840,7 @@ async def cb_download(callback: types.CallbackQuery):
 
         async def _via_direct():
             # Как в документации Catugram: файл прямо в поле audio (без attach://)
-            res = await send_audio_direct(chat_id, path, item, caption)
+            res = await send_direct_adaptive(chat_id, path, item, caption, prefix)
             return (res.get("audio") or {}).get("file_id")
 
         async def _via_url():
