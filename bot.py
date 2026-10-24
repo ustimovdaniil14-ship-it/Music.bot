@@ -547,6 +547,31 @@ async def cmd_probedoc(message: types.Message):
     await message.answer("<b>Итог:</b>\n" + "\n".join(lines) + tip)
 
 
+@dp.message(Command("probevoice"))
+async def cmd_probevoice(message: types.Message):
+    """Только для админа: проверяет sendVoice (ogg/opus) на сервере."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    p = os.path.join(DOWNLOAD_DIR, "pv_test.ogg")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=8",
+            "-c:a", "libopus", "-b:a", "48k", p,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await asyncio.wait_for(proc.wait(), timeout=30)
+        res = await post_file("sendVoice", "voice", message.chat.id, p,
+                              "voice.ogg", "audio/ogg", {"duration": "8"})
+        kind = "voice" if res.get("voice") else ("audio" if res.get("audio") else "document" if res.get("document") else "?")
+        await message.answer(f"✅ sendVoice принят (пришло как: {kind}). Если выше видно плеер — ставь TRY_VOICE=1 в Render.")
+    except Exception as e:
+        await message.answer(f"❌ sendVoice: <code>{esc(str(e)[:300])}</code>")
+    finally:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
 @dp.message(Command("probe"))
 async def cmd_probe(message: types.Message):
     """Только для админа: проверяет, файлы какого размера принимает сервер."""
@@ -714,6 +739,7 @@ async def on_search(message: types.Message, state: FSMContext):
 # и отвергает sendAudio (MEDIA_INVALID) — работает sendDocument. Лимит можно поднять
 # переменной окружения DOC_MAX_BYTES после теста командой /probedoc.
 DOC_MAX_BYTES = int(os.getenv("DOC_MAX_BYTES", "893802"))  # по тесту /probedoc: 969 КБ ок, 1500 КБ уже FILE_ID_INVALID
+TRY_VOICE = os.getenv("TRY_VOICE", "0") == "1"  # слать трек как голосовое (ogg/opus) — плеер в чате
 TRY_AUDIO = os.getenv("TRY_AUDIO", "0") == "1"  # пробовать sendAudio (сейчас не работает)
 
 
@@ -998,7 +1024,7 @@ async def cb_download(callback: types.CallbackQuery):
                                 f"{ascii_name}.mp3", "audio/mpeg", extra)
             return None
 
-        FILEID_AUDIO_OK = {"v": True}  # если сервер ни разу не принял — больше не пробуем
+        FILEID_AUDIO_OK = {"v": os.getenv("TRY_DOCID", "0") == "1"}  # если сервер ни разу не принял — больше не пробуем
 
         async def _via_docid_audio():
             # Трюк: sendDocument работает, sendAudio с загрузкой — нет (MEDIA_INVALID).
@@ -1033,12 +1059,44 @@ async def cb_download(callback: types.CallbackQuery):
                 raise RuntimeError(f"{data.get('error_code')} {data.get('description')}")
             return ((data.get("result") or {}).get("audio") or {}).get("file_id")
 
+        async def _via_voice():
+            # sendVoice: плеер в чате; opus на 48k весит ~в 2.5 раза меньше mp3 128k
+            dur = max(int(item.get("duration") or 180), 1)
+            vk = max(16, min(64, int(DOC_MAX_BYTES * 0.92 * 8 / 1000 / dur)))
+            ogg = f"{prefix}_voice.ogg"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", path, "-vn", "-map_metadata", "-1",
+                "-c:a", "libopus", "-b:a", f"{vk}k", "-application", "audio", ogg,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), timeout=90)
+            if not os.path.exists(ogg) or os.path.getsize(ogg) < 2000:
+                raise RuntimeError("ffmpeg opus не получился")
+            try:
+                cap = f"🎧 <b>{esc(item['title'][:100])}</b>"
+                if item.get("artist"):
+                    cap += f"\n{esc(item['artist'][:100])}"
+                extra = {"caption": cap, "parse_mode": "HTML", "duration": str(dur),
+                         "reply_markup": json.dumps(
+                             {"inline_keyboard": [[{"text": "💖 Поддержать автора",
+                                                    "callback_data": "start_donate"}]]},
+                             ensure_ascii=False)}
+                res = await post_file("sendVoice", "voice", chat_id, ogg,
+                                      "voice.ogg", "audio/ogg", extra)
+            finally:
+                try:
+                    os.remove(ogg)
+                except Exception:
+                    pass
+            return None
+
         methods = []
         if TRY_AUDIO:
             methods.append(("direct-upload", _via_direct))
             if PUBLIC_BASE:
                 methods.append(("url", _via_url))
             methods.append(("aiogram-upload", _via_aiogram))
+        if TRY_VOICE:
+            methods.append(("voice", _via_voice))
         if use_doc:
             methods.append(("docid-audio", _via_docid_audio))
             methods.append(("document", _via_document))
